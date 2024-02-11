@@ -1,0 +1,3 @@
+buffer: where text resides
+window: displays one buffer at any time.
+frame: contains one or more windows
