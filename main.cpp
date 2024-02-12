@@ -1,4 +1,5 @@
 #include <stdio.h>
+#include <fstream>
 #include <unistd.h>
 #include <termios.h>
 #include <stdexcept>
@@ -29,8 +30,8 @@ struct Node {
   int lineCount;
 };
 struct PieceTable {
-  char* orig;
-  char* added;
+  std::string orig;
+  std::string added;
   std::vector<Node> nodes;
 };
 
@@ -66,21 +67,91 @@ enum KEY_ACTION {
   PAGE_DOWN
 };
 
+namespace esq {//Escape SeQuence
+constexpr std::string_view line  = "\x1b[0K\r\n";
+constexpr std::string_view gohome = "\x1b[H";
+constexpr std::string_view hidecursor = "\x1b[?25l";
+}
+
 template <size_t N>
 void writeN(const char (&s)[N]) {
   write(STDOUT_FILENO, s, N-1);
 }
+//len is \n exclusive 
+void drawLine(std::string& output, const char* from, int len) {
+  for (int i = 0; i<len; i++) {
+    char c = from[i];
+    if (c == TAB) {
+      output.append("    ");
+      continue;
+    }
+    output += c;
+  }
+  output.append(esq::line);
+}
+//fill lines. if node has lines more than enough, return is <=0
+int drawNode(std::string& output, int linesToFill, FileBuffer& fb, Node& node) {
+  //yet to be filled *after* this func finishes
+  int linesYetFilled = linesToFill - (int)node.lineStarts.size();
+  char* orig = fb.pt.orig.data();
+  
+  if (linesYetFilled < 0) {// node has more lines than linesToFill
+    for (int y=0; y<linesToFill; y++) {
+      int start = node.lineStarts[y];
+      char* from = &orig[start];
+      int len = node.lineStarts[y+1]-start-1; //line len, excluding newline
+      drawLine(output, from, len);
+    }
+  } else {
+    for (int y=0; y<(int)node.lineStarts.size()-1; y++) {
+      int start = node.lineStarts[y];
+      char* from = &orig[start];
+      int len = node.lineStarts[y+1]-start-1; //line len, excluding newline
+      drawLine(output, from, len);
+    }
+    //for the last line, line might not contain newline.
+    int start = node.lineStarts[node.lineStarts.size()-1];
+    char* from = &orig[start]; //start of last line
+    int len = node.length - start;
+    //may or may not contain \n at the end
+    if (from[len-1] == '\n') {
+      len--;
+    }
+    drawLine(output, from, len);
+  }
+  
+  return linesYetFilled;
+}
+//if file is shorter than screen height, write "~" to indicate the row emptyness
+void drawTildes(std::string& output, int lines) {
+  for (int y = 0; y<lines; y++) {
+    output.append("~");
+    output.append(esq::line);
+  }
+}
 int STATUS_HEIGHT = 2;
 void drawBuffer(std::string& output, FileBuffer& fb) {
-  for (int y = 0; y<context.term_height - STATUS_HEIGHT; y++) {
-    output += "fuck\r\n";
+  int linesYetFilled = context.term_height-STATUS_HEIGHT;
+  for (int i = 0; i<(int)fb.pt.nodes.size() && linesYetFilled>0; i++) {
+    auto& node = fb.pt.nodes[i];
+    if (node.type == NodeType::Original) {
+      linesYetFilled = drawNode(output, linesYetFilled, fb, node);
+    }
   }
+
+  if (linesYetFilled>0) {
+    drawTildes(output, linesYetFilled);
+  }
+
+  output.append("status");
+  output.append(esq::line);
+  output.append("message");
+  // output.append(esq::line);
 }
 void drawScreen(FileBuffer& fb) {
   std::string output;
-  output += "\x1b[?25l"; /* Hide cursor. */
-  output += "\x1b[H";    /* Go home. */
-  
+  output += esq::hidecursor;
+  output += esq::gohome;
   drawBuffer(output, fb);
   write(STDOUT_FILENO, output.data(), output.size());
 }
@@ -114,7 +185,6 @@ int readKey() {
 }
 void processKey(FileBuffer& fb) {
   int c = readKey();
-  printf("%d %c\r\n", c, c);
   if (c == 'q') {
     kill();
   }
@@ -122,28 +192,42 @@ void processKey(FileBuffer& fb) {
 
 template <typename T>
 class Defer {
-    const T f;
+  T f;
 public:
-    Defer(const T &f_) : f(f_){}
-    ~Defer(){ f(); }
+  Defer(T&& f_) : f(std::forward<T>(f_)) {}
+  ~Defer(){ f(); }
 };
 
-#define CONCATINATE(x,y) x ## y
+#define CONCATINATE_(x,y) x ## y
+#define CONCATINATE(x,y) CONCATINATE_(x, y)
 #define defer Defer CONCATINATE(__defer__,__LINE__)=
 
-std::pair<char*, size_t> openFile(const char* filename) {
-  int fd = open(filename, O_RDONLY);
-  defer [fd]() {close(fd);};
-  struct stat sb;
-  if (fstat(fd, &sb) == -1) {
-    return {nullptr, 0};
+int openFile(const char* filename, FileBuffer& fb) {
+  FILE* fp = fopen(filename, "r");
+  if (!fp) return -1;
+  defer [&fp](){fclose(fp);};
+  
+  fseek(fp, 0, SEEK_END);
+  auto filesize = ftell(fp);
+  if (filesize > 1073741824) {
+    throw std::runtime_error("file too large");
   }
-  if (sb.st_size > 1073741824) { //1GB
-    //TODO: WARNING
-    return {nullptr, 0};
+  fseek(fp, 0, SEEK_SET);
+  Node n{.type=NodeType::Original, .start=0, .length=0, .lineCount =0};
+  char* line = NULL;
+  size_t linecap = 0;
+  int acc = 0;
+  ssize_t linelen;
+  while ((linelen = getline(&line, &linecap, fp)) != -1) {
+    n.lineCount++;
+    n.lineStarts.push_back(acc);
+    acc+=linelen;
+    fb.pt.orig.append(line);
   }
+  n.length = acc;
 
-  return {(char*)mmap(NULL, sb.st_size, PROT_READ, MAP_PRIVATE, fd, 0), sb.st_size};
+  fb.pt.nodes.push_back(std::move(n));
+  return 0;
 }
 int getTermSize(int& width, int& height) {
   struct winsize ws;
@@ -186,14 +270,12 @@ void init() {
   if (getTermSize(context.term_width, context.term_height) == -1) {
     throw std::runtime_error("Failed to get terminal size");
   }
-  printf("terminal :%d %d\r\n", context.term_width, context.term_width);
 }
 int main(int argc, char** argv) {
   if (argc < 2) {
     printf("usage: ./texteditor filename\n");
     return 0;
   }
-  
   init();
   auto orig = enterRawMode();
   defer [&orig]() {
@@ -201,16 +283,11 @@ int main(int argc, char** argv) {
     tcsetattr(STDIN_FILENO, TCSAFLUSH, &orig);
   };
   
-  auto [addr, stsize] = openFile(argv[1]);
-  if (addr == nullptr) {
+  FileBuffer fb;
+  if (openFile(argv[1], fb) == -1) {
     printf("file not exist\r\n");
     // return 0;
   }
-  Node node{.type=NodeType::Original, .start=0, .length=(int)stsize};
-  FileBuffer fb;
-  fb.pt.orig = addr;
-  fb.pt.nodes.push_back(std::move(node));
-
   while (context.running) {
     drawScreen(fb);
     processKey(fb);
