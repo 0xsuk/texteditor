@@ -1,3 +1,13 @@
+//about piece table
+original: original buffer
+added: added buffer
+node: piece descriptor.
+bufOffset: offset of char w.r.t. the buffer (original or added buffer)
+position: index of char w.r.t. the file
+newlineOffset: offset of \n w.r.t. the string
+
+
+//general
 buffer: where text resides
 window: displays one buffer at any time.
 frame: contains one or more windows
