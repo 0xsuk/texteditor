@@ -2,6 +2,7 @@
 #include <fstream>
 #include <unistd.h>
 #include <termios.h>
+#include <chrono>
 #include <stdexcept>
 #include <sys/mman.h>
 #include <vector>
@@ -183,11 +184,17 @@ void drawBuffer(std::string& output, FileBuffer& fb) {
   output.append("\x1b[m");
   output.append(fb.message);
 }
+void drawCursor(std::string& output) {
+  auto row = context.rowoff + context.cy;
+  output.append("\x1b[" + std::to_string(context.cy + 1) + ';' + std::to_string(context.cx + 1) + 'H');
+  output.append("\x1b[?25h");
+}
 void drawScreen(FileBuffer& fb) {
   std::string output;
   output += esq::hidecursor;
   output += esq::gohome;
   drawBuffer(output, fb);
+  drawCursor(output);
   write(STDOUT_FILENO, output.data(), output.size());
 }
 int handleEsc() {
@@ -202,19 +209,81 @@ int handleEsc() {
   }
 
   if (seq[0] == '[') {
-    //TODO
+    if (seq[1] >= '0' && seq[1] <= '9') {
+      if (read(STDIN_FILENO, seq+2, 1) == 0)
+        return ESC;
+      if (seq[2] == '~') {
+        switch (seq[1]) {
+        case '3':
+          return DEL_KEY;
+        case '5':
+          return PAGE_UP;
+        case '6':
+          return PAGE_DOWN;
+        }
+      }
+    } else  {
+      switch (seq[1]) {
+      case 'A':
+        return ARROW_UP;
+      case 'B':
+        return ARROW_DOWN;
+      case 'C':
+        return ARROW_RIGHT;
+      case 'D':
+        return ARROW_LEFT;
+      case 'H':
+        return HOME_KEY;
+      case 'F':
+        return END_KEY;
+      }
+        
+    }
   }
   return 0;
 }
+int getVisualRowSize(const PieceTable& pt, int row) {
+  for (int i = 0; i<(int)pt.nodes.size(); i++) {
+    const auto& node = pt.nodes[i];
+    int nlines = node.newlineOffsets.size();
+  }
+}
+//node index at the beginning of row.
+//row is 0 oriented, w.r.t. file
+int getRowSize(const PieceTable& pt, int row) {
+  int remain = row;
+  int acc = 0;
+  for (int i = 0; i<(int)pt.nodes.size(); i++) {
+    const auto& node = pt.nodes[i];
+    int nlines = node.newlineOffsets.size();
+    int tmp = remain - nlines;
+    if (tmp<0) {
+      if (nlines == 1) {
+        return node.length + acc;
+      } else  {
+        return node.newlineOffsets[remain]-node.newlineOffsets[remain-1];
+      }
+    } else if (tmp == 0) {
+      if (nlines == 0) {
+        acc+=node.length;
+      } else {
+        acc = node.length - node.newlineOffsets[nlines-1]-1;
+      }
+    }
+    remain = tmp;
+  }
+
+  return 0;
+}
 //get node that position points to, and offset w.r.t. the buffer of that node type
-void getNodeIdxAndBufOffset(int& nodeIdxAndBufOffset, int& bufOffset, const PieceTable& pt, int position) {
+void getNodeIdxAndBufOffset(int& nodeIdx, int& bufOffset, const PieceTable& pt, int position) {
   int remainingOffset = position;
   for (int i = 0; i<(int)pt.nodes.size(); i++) {
     const auto& node = pt.nodes[i];
     int nodeLen = node.length;
     if (remainingOffset <= nodeLen) {
       //i, node.offset + remainingOffset;
-      nodeIdxAndBufOffset = i;
+      nodeIdx = i;
       bufOffset = node.start + remainingOffset;
       return;
     }
@@ -282,19 +351,27 @@ bool canMergeEdit(Edit& tmp, Edit& e) {
     return tmp.position == e.position;
   }
 }
-void insertChar(PieceTable& pt, int c) {
+inline long millisec() {
+  auto currentTime = std::chrono::system_clock::now();
+  return std::chrono::time_point_cast<std::chrono::milliseconds>(currentTime).time_since_epoch().count();
+}
+void insertChar(PieceTable& pt, char c) {
   int position = 0; //TODO for now add to the beginning of file
   
   int nodeIdx, bufOffset;
   getNodeIdxAndBufOffset(nodeIdx, bufOffset, pt, position);
 
-  // Edit e{.time=0, .isInsert=true, .position=position, .str="first"};
+  Edit e{.time = millisec(),
+         .isInsert = true,
+         .position = position,
+         .str = {c}};
 
-  // if (canMergeEdit(pt.tmp, e)) {
-  //   mergeEdit(pt.tmp, e);
-  // } else {
-  //   applyTmpEdit(pt);
-  // }
+  if (canMergeEdit(pt.tmp, e)) {
+    mergeEdit(pt.tmp, e);
+  } else {
+    applyTmpEdit(pt);
+    pt.tmp = std::move(e);
+  }
 }
 int readKey() {
   char c;
@@ -308,18 +385,105 @@ int readKey() {
 
   return c;
 }
+void move_cursor(PieceTable& pt, int key) {
+  auto filerow = context.rowoff + context.cy;
+  auto filecol = context.coloff + context.cx;
+  
+  switch (key) {
+  case ARROW_LEFT:
+    if (context.cx == 0) {
+      if (context.coloff>0) {
+        context.coloff--;
+      } else {
+        if (filerow > 0) {
+          //go to the end of previous line
+          context.cy--;
+          
+          context.cx = getRowSize(pt, filerow-1)-1;
+          if (context.cx > context.term_width - 1) {
+            context.coloff = context.cx - context.term_width + 1;
+            context.cx = context.term_width - 1;
+          }
+        }
+      }
+    } else {
+      context.cx -= 1;
+    }
+    break;
+  case ARROW_DOWN:
+    context.cy++;
+    break;
+    
+  }
+  
+  // case term::ARROW_RIGHT:
+  //   if (row && filecol < row->chars.size()) {
+  //     if (E.cx == E.screencols - 1) {
+  //       E.coloff++;
+  //     } else {
+  //       E.cx += 1;
+  //     }
+  //   } else if (row && filecol == row->chars.size()) {
+  //     E.cx = 0;
+  //     E.coloff = 0;
+  //     if (E.cy == E.screenrows - 1) {
+  //       E.rowoff++;
+  //     } else {
+  //       E.cy += 1;
+  //     }
+  //   }
+  //   break;
+  // case term::ARROW_UP:
+  //   if (E.cy == 0) {
+  //     if (E.rowoff)
+  //       E.rowoff--;
+  //   } else {
+  //     E.cy -= 1;
+  //   }
+  //   break;
+  // case term::ARROW_DOWN:
+  //   if (filerow < E.row.size()) {
+  //     if (E.cy == E.screenrows - 1) {
+  //       E.rowoff++;
+  //     } else {
+  //       E.cy += 1;
+  //     }
+  //   }
+  //   break;
+  // }
+  // /* Fix cx if the current line has not enough chars. */
+  // filerow = E.rowoff + E.cy;
+  // filecol = E.coloff + E.cx;
+  // row = (filerow >= E.row.size()) ? nullptr : &E.row[filerow];
+  // rowlen = row ? row->chars.size() : 0;
+  // if (filecol > rowlen) {
+  //   const auto reminder = filecol - rowlen;
+  //   if (reminder > E.cx) {
+  //     E.coloff -= reminder - E.cx;
+  //     E.cx = 0;
+  //   } else {
+  //     E.cx -= reminder;
+  //   }
+  // }
+}
 void processKey(FileBuffer& fb) {
-  int c = readKey();
-  if (c == CTRL_Q) {
+  int key = readKey();
+  if (key == CTRL_Q) {
     kill();
   }
 
-  switch (c) {
+  switch (key) {
   case ENTER:
     insertNewLine(fb.pt);
     break;
+  case ARROW_DOWN:
+  case ARROW_UP:
+  case ARROW_LEFT:
+  case ARROW_RIGHT:
+    move_cursor(fb.pt, key);
+    break;
   default:
-    insertChar(fb.pt, c);
+    insertChar(fb.pt, key);
   }
 }
 
@@ -344,10 +508,6 @@ void readLines(FILE* fp, std::string& orig, std::vector<int>& newlineOffsets) {
     offset+=linelen; //offset of \n
     newlineOffsets.push_back(offset);
     orig.append(line);
-
-    if (line[linelen-1] == '\n') {
-      log << linelen <<std::endl;
-    }
   }
   //last line might not contain \n at the end
   if (orig[orig.size()-1] != '\n') {
